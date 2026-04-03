@@ -1,0 +1,9 @@
+# Claude Code machine-local settings
+.claude/
+
+# Windows junk
+Thumbs.db
+desktop.ini
+
+# Dev tooling runtime artifacts
+Tools/last_session.log

@@ -1,0 +1,51 @@
+{
+    "SchemaVersion": 1,
+    "ModName": "Inventory Expanded",
+    "Tabs": [
+        {
+            "TabId": "settings",
+            "Name": "Settings",
+            "Sections": [
+                {
+                    "SectionId": "behavior",
+                    "SectionName": "Behavior",
+                    "Settings": [
+                        {
+                            "Id": "inventory_panel_key",
+                            "Name": "Inventory Panel",
+                            "Type": "keybinding_v2",
+                            "Default": {
+                                "Keyboard": {
+                                    "Key": "F10"
+                                }
+                            },
+                            "Description": "Opens or closes the shared inventory panel."
+                        },
+                        {
+                            "Id": "armory_panel_key",
+                            "Name": "Armory Panel",
+                            "Type": "keybinding_v2",
+                            "Default": {
+                                "Keyboard": {
+                                    "Key": "F11"
+                                }
+                            },
+                            "Description": "Opens or closes the armory panel."
+                        },
+                        {
+                            "Id": "double_click_ms",
+                            "Name": "Double-click Equip Window (ms)",
+                            "Type": "slider_int",
+                            "Default": 600,
+                            "Options": {
+                                "Min": 200,
+                                "Max": 1500
+                            },
+                            "Description": "How much time you get for a double-click equip. Bump it up if the second click keeps missing."
+                        }
+                    ]
+                }
+            ]
+        }
+    ]
+}
