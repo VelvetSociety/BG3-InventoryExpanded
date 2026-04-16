@@ -1,0 +1,606 @@
+--- Enumerates all party member inventories and sends data to clients.
+-- @module InventoryCollector
+
+local InventoryCollector = {}
+
+--- Collect all items from all party members.
+-- @return array of item tables
+function InventoryCollector.CollectAll()
+    local allItems = {}
+
+    -- Try multiple methods to get party members
+    local partyMembers = nil
+
+    local ok, result = pcall(function() return Osi.DB_IsPlayer:Get(nil) end)
+    if ok and result then
+        partyMembers = result
+    end
+
+    if not partyMembers then
+        local ok2, result2 = pcall(function() return Osi.DB_PartyMembers:Get(nil) end)
+        if ok2 and result2 then
+            partyMembers = result2
+        end
+    end
+
+    if not partyMembers then
+        _P("[InventoryExpanded] No party members found via Osiris DB")
+        return allItems
+    end
+
+    for _, tuple in pairs(partyMembers) do
+        local charUUID = tuple[1]
+        local ok3, err = pcall(function()
+            local charEntity = Ext.Entity.Get(charUUID)
+            if charEntity then
+                local charItems = InventoryCollector.CollectFromCharacter(charUUID, charEntity)
+                for _, item in ipairs(charItems) do
+                    allItems[#allItems + 1] = item
+                end
+            end
+        end)
+        if not ok3 then
+            _P("[InventoryExpanded] Error collecting from " .. tostring(charUUID) .. ": " .. tostring(err))
+        end
+    end
+
+    -- Also collect from each character's personal camp chest
+    local campItems = InventoryCollector.CollectFromCampChests(partyMembers)
+    for _, item in ipairs(campItems) do
+        allItems[#allItems + 1] = item
+    end
+
+    -- Mark actually-equipped items using Osi.GetEquippedItem
+    InventoryCollector._markEquippedItems(allItems, partyMembers)
+
+    _P("[InventoryExpanded] Collected " .. #allItems .. " items total (" .. #campItems .. " from camp chests) across " .. #partyMembers .. " characters")
+    return allItems
+end
+
+--- Recursive helper: collect all items from a container entity into a result table.
+-- Recurses into bag items (Backpack, Keychain, Pouch, etc.) up to depth limit.
+-- @param containerEntity Entity
+-- @param depth number  current recursion depth
+-- @param charUUID string  owner character UUID
+-- @param charName string  owner display name
+-- @param result table  array to append items into
+local function collectContainerInto(containerEntity, depth, charUUID, charName, result)
+    if depth > 4 then return end
+    pcall(function()
+        local container = containerEntity.InventoryContainer
+        if not container or not container.Items then return end
+        for _, slotData in pairs(container.Items) do
+            pcall(function()
+                local itemEntity = slotData.Item or slotData
+                if not itemEntity then return end
+
+                local itemData = InventoryCollector._extractItemData(itemEntity, charUUID, charName)
+                if itemData then
+                    result[#result + 1] = itemData
+                end
+
+                -- If this item is itself a container (bag), recurse into it
+                pcall(function()
+                    if itemEntity.InventoryContainer then
+                        collectContainerInto(itemEntity, depth + 1, charUUID, charName, result)
+                    end
+                end)
+            end)
+        end
+    end)
+end
+
+--- Collect items from a single character's inventory, recursing into bag items.
+-- @param charUUID string
+-- @param charEntity Entity
+-- @return array of item tables
+function InventoryCollector.CollectFromCharacter(charUUID, charEntity)
+    local result = {}
+
+    local inventoryOwner = charEntity.InventoryOwner
+    if not inventoryOwner or not inventoryOwner.Inventories then
+        return result
+    end
+
+    local charName = InventoryCollector._getCharacterName(charEntity) or charUUID
+
+    for _, invEntity in ipairs(inventoryOwner.Inventories) do
+        collectContainerInto(invEntity, 0, charUUID, charName, result)
+    end
+
+    return result
+end
+
+--- Collect items from camp chests for all party members.
+-- Each player character has a personal camp chest tracked via DB_Camp_UserCampChest.
+-- Camp chest items are attributed to the owning character (OwnerName unchanged) with
+-- a Source="CampChest" flag so callers can distinguish them if needed.
+-- @param partyMembers table  array of {charUUID} tuples from DB_IsPlayer
+-- @return array of item tables
+function InventoryCollector.CollectFromCampChests(partyMembers)
+    local result = {}
+
+    for _, tuple in pairs(partyMembers) do
+        local charUUID = tuple[1]
+        pcall(function()
+            -- Resolve this character's reserved user ID
+            local userId = Osi.GetReservedUserID(charUUID)
+            if not userId then return end
+
+            -- Look up their personal camp chest
+            local rows = nil
+            pcall(function() rows = Osi.DB_Camp_UserCampChest:Get(userId, nil) end)
+            if not rows or #rows == 0 then return end
+
+            local charEntity = Ext.Entity.Get(charUUID)
+            local charName = (charEntity and InventoryCollector._getCharacterName(charEntity)) or charUUID
+
+            for _, row in ipairs(rows) do
+                local chestUUID = row[2]
+                if not chestUUID then return end
+
+                local chestEntity = Ext.Entity.Get(chestUUID)
+                if not chestEntity then return end
+
+                local chestItems = {}
+
+                -- Camp chests may store items under InventoryOwner.Inventories (like characters)
+                -- or directly in InventoryContainer.  Try both.
+                local usedOwner = false
+                pcall(function()
+                    if chestEntity.InventoryOwner and chestEntity.InventoryOwner.Inventories then
+                        local invs = chestEntity.InventoryOwner.Inventories
+                        for _, invEntity in ipairs(invs) do
+                            collectContainerInto(invEntity, 0, charUUID, charName, chestItems)
+                        end
+                        usedOwner = true
+                    end
+                end)
+
+                if not usedOwner then
+                    collectContainerInto(chestEntity, 0, charUUID, charName, chestItems)
+                end
+
+                -- Tag each item as coming from the camp chest
+                for _, item in ipairs(chestItems) do
+                    item.Source = "CampChest"
+                    result[#result + 1] = item
+                end
+
+                _P("[InventoryExpanded] Camp chest for " .. charName .. ": " .. #chestItems .. " items")
+            end
+        end)
+    end
+
+    return result
+end
+
+--- Mark items as equipped by querying Osi.GetEquippedItem for each character+slot.
+-- This replaces the broken InventoryMember.EquipmentSlot check which is always >= 0.
+function InventoryCollector._markEquippedItems(allItems, partyMembers)
+    -- Build a UUID → item lookup
+    local byUUID = {}
+    for _, item in ipairs(allItems) do
+        if item.UUID then byUUID[item.UUID] = item end
+    end
+
+    local EQUIP_SLOTS = {
+        "Helmet", "Breast", "Cloak", "MeleeMainHand", "MeleeOffHand",
+        "RangedMainHand", "RangedOffHand", "Gloves", "Boots",
+        "Amulet", "Ring", "Ring2", "Underwear", "VanityBody", "VanityBoots",
+    }
+
+    -- Method 1: Osi.GetEquippedItem (works for armor/vanity slots)
+    for _, tuple in pairs(partyMembers) do
+        local charUUID = tuple[1]
+        for _, slotName in ipairs(EQUIP_SLOTS) do
+            pcall(function()
+                local equippedUUID = Osi.GetEquippedItem(charUUID, slotName)
+                if equippedUUID and byUUID[equippedUUID] then
+                    byUUID[equippedUUID].Equipped = true
+                    -- Record the physical slot this item is actually equipped in
+                    byUUID[equippedUUID].EquippedInSlot = slotName
+                end
+            end)
+        end
+    end
+
+    -- Method 2: Equipment inventory container (catches weapon slots that Osi misses).
+    -- The 2nd inventory (index 2) on each character is the equipment container.
+    -- Slot indices in the container map to equipment slots by position.
+    local containerSlotMap = {
+        [0]  = "Helmet",
+        [1]  = "Breast",
+        [2]  = "Cloak",
+        [3]  = "MeleeMainHand",
+        [4]  = "MeleeOffHand",
+        [5]  = "RangedMainHand",
+        [6]  = "RangedOffHand",
+        [7]  = "Gloves",
+        [8]  = "Amulet",
+        [9]  = "Ring",
+        [10] = "Ring2",
+        [11] = "Boots",
+        [12] = "Underwear",
+        [13] = "VanityBody",
+        [14] = "VanityBoots",
+    }
+    for _, tuple in pairs(partyMembers) do
+        local charUUID = tuple[1]
+        pcall(function()
+            local charEntity = Ext.Entity.Get(charUUID)
+            if not charEntity or not charEntity.InventoryOwner then return end
+            local inventories = charEntity.InventoryOwner.Inventories
+            if not inventories then return end
+            -- Equipment container is typically at index 2 (1-based)
+            for invIdx = 2, #inventories do
+                pcall(function()
+                    local inv = inventories[invIdx]
+                    if not inv or not inv.InventoryContainer then return end
+                    local container = inv.InventoryContainer
+                    if not container or not container.Items then return end
+                    for slotIdx, slotData in pairs(container.Items) do
+                        pcall(function()
+                            local itemEntity = slotData.Item or slotData
+                            if not itemEntity or not itemEntity.Uuid then return end
+                            local uuid = itemEntity.Uuid.EntityUuid
+                            if uuid and byUUID[uuid] then
+                                byUUID[uuid].Equipped = true
+                                -- Set EquippedInSlot from container index if not already set
+                                if not byUUID[uuid].EquippedInSlot then
+                                    local slotName = containerSlotMap[slotIdx]
+                                    if slotName then
+                                        byUUID[uuid].EquippedInSlot = slotName
+                                    end
+                                end
+                            end
+                        end)
+                    end
+                end)
+            end
+        end)
+    end
+
+    -- Method 3: Equipment.Slots component — determines the PHYSICAL slot each weapon/ring
+    -- is equipped in. Osi.GetEquippedItem returns nil for these slots; this is the authoritative
+    -- source for MainHand, OffHand, Ranged, Ring, Ring2.
+    local equipEnumToSlotName = {
+        MainHand = "MeleeMainHand",
+        OffHand  = "MeleeOffHand",
+        Ranged   = "RangedMainHand",
+        Ring     = "Ring",
+        Ring2    = "Ring2",
+    }
+    for _, tuple in pairs(partyMembers) do
+        local charUUID = tuple[1]
+        pcall(function()
+            local charEntity = Ext.Entity.Get(charUUID)
+            if not charEntity or not charEntity.Equipment then return end
+            local slots = charEntity.Equipment.Slots
+            if not slots then return end
+            for enumName, slotId in pairs(equipEnumToSlotName) do
+                pcall(function()
+                    local slotEnum = Ext.Enums.EquipmentSlot[enumName]
+                    if not slotEnum then return end
+                    local handle = slots[slotEnum]
+                    if not handle then return end
+
+                    -- The handle may be an entity reference, not a UUID string.
+                    -- Try multiple approaches to resolve the UUID.
+                    local uuid = nil
+
+                    -- Approach A: handle might be an entity with Uuid component
+                    pcall(function()
+                        if handle.Uuid and handle.Uuid.EntityUuid then
+                            uuid = handle.Uuid.EntityUuid
+                        end
+                    end)
+
+                    -- Approach B: handle might resolve via Ext.Entity.Get
+                    if not uuid then
+                        pcall(function()
+                            local entity = Ext.Entity.Get(handle)
+                            if entity and entity.Uuid then
+                                uuid = entity.Uuid.EntityUuid
+                            end
+                        end)
+                    end
+
+                    -- Approach C: tostring might give a UUID directly
+                    if not uuid then
+                        pcall(function()
+                            local s = tostring(handle)
+                            -- Check if it looks like a UUID (contains dashes)
+                            if s and s:match("%x+%-%x+%-%x+%-%x+%-%x+") then
+                                uuid = s
+                            end
+                        end)
+                    end
+
+                    if uuid and uuid ~= "" and uuid ~= "00000000-0000-0000-0000-000000000000" and byUUID[uuid] then
+                        byUUID[uuid].Equipped = true
+                        byUUID[uuid].EquippedInSlot = slotId
+                    end
+                end)
+            end
+        end)
+    end
+end
+
+--- Extract relevant data from an item entity.
+function InventoryCollector._extractItemData(itemEntity, ownerUUID, ownerName)
+    local ok, itemData = pcall(function()
+        if not itemEntity then return nil end
+
+        -- Get UUID
+        local uuid = nil
+        if itemEntity.Uuid then
+            uuid = itemEntity.Uuid.EntityUuid
+        end
+        if not uuid then return nil end
+
+        local item = {
+            UUID = uuid,
+            Name = "",
+            Type = "Misc",
+            Rarity = "Common",
+            Weight = 0,
+            Value = 0,
+            OwnerUUID = ownerUUID,
+            OwnerName = ownerName,
+            Icon = "",
+            StackSize = 1,
+            Slot = "",
+            Equipped = false,
+            Enchantments = {},
+        }
+
+        -- Name
+        if itemEntity.DisplayName and itemEntity.DisplayName.Name then
+            local nameHandle = itemEntity.DisplayName.Name.Handle
+            if nameHandle then
+                local handle = nameHandle.Handle or nameHandle
+                local translated = Ext.Loca.GetTranslatedString(handle)
+                if translated then
+                    item.Name = translated
+                end
+            end
+        end
+
+        -- Rarity
+        if itemEntity.Value and itemEntity.Value.Rarity then
+            local rarityMap = {[0]="Common", [1]="Uncommon", [2]="Rare", [3]="VeryRare", [4]="Legendary"}
+            item.Rarity = rarityMap[itemEntity.Value.Rarity] or "Common"
+        end
+
+        -- Value
+        if itemEntity.Value and itemEntity.Value.Value then
+            item.Value = itemEntity.Value.Value
+        end
+
+        -- Weight
+        if itemEntity.Data and itemEntity.Data.Weight then
+            item.Weight = itemEntity.Data.Weight
+        end
+
+        -- Stack size (per-entity amount for pre-stacked items e.g. sold in bundles)
+        -- Inner pcall: InventoryStack.Amount may throw on stacked entities, which would
+        -- otherwise kill the entire outer pcall and silently discard the item.
+        pcall(function()
+            if itemEntity.InventoryStack then
+                item.StackSize = tonumber(itemEntity.InventoryStack.Amount) or 1
+            end
+        end)
+
+        -- Icon
+        if itemEntity.Icon and itemEntity.Icon.Icon then
+            item.Icon = itemEntity.Icon.Icon
+        end
+
+        -- Equipment slot
+        if itemEntity.Equipable and itemEntity.Equipable.Slot then
+            item.Slot = tostring(itemEntity.Equipable.Slot)
+        end
+
+        -- Note: Equipped flag is set later by _markEquippedItems() using Osi.GetEquippedItem
+        -- (InventoryMember.EquipmentSlot is a container index, always >= 0, NOT an equipped indicator)
+
+        -- Description (from DisplayName component or template)
+        pcall(function()
+            if itemEntity.DisplayName and itemEntity.DisplayName.Description then
+                local descHandle = itemEntity.DisplayName.Description.Handle
+                if descHandle then
+                    local handle = descHandle.Handle or descHandle
+                    local translated = Ext.Loca.GetTranslatedString(handle)
+                    if translated and translated ~= "" then
+                        item.Description = translated
+                    end
+                end
+            end
+        end)
+
+        -- Fallback: try getting description from root template
+        if not item.Description or item.Description == "" then
+            pcall(function()
+                if itemEntity.OriginalTemplate then
+                    local tmplId = itemEntity.OriginalTemplate.OriginalTemplate
+                    if tmplId then
+                        local tmpl = Ext.Template.GetRootTemplate(tmplId)
+                        if tmpl and tmpl.Description then
+                            local descHandle = tmpl.Description.Handle
+                            if descHandle then
+                                local handle = descHandle.Handle or descHandle
+                                local translated = Ext.Loca.GetTranslatedString(handle)
+                                if translated and translated ~= "" then
+                                    item.Description = translated
+                                end
+                            end
+                        end
+                    end
+                end
+            end)
+        end
+
+        item.Description = item.Description or ""
+
+        -- Item type classification
+        item.Type = InventoryCollector._classifyItemType(itemEntity)
+
+        -- Stats (damage, armor class, passives, boosts)
+        pcall(function()
+            local statsId = nil
+            if itemEntity.Data then
+                pcall(function() statsId = itemEntity.Data.StatsId end)
+            end
+            if not statsId and itemEntity.ServerItem then
+                pcall(function() statsId = itemEntity.ServerItem.StatsId end)
+            end
+
+            if statsId and statsId ~= "" then
+                local stat = Ext.Stats.Get(statsId)
+                if stat then
+                    -- Weapon damage (confirmed attribute names from DIAG V3)
+                    if item.Type == "Weapon" then
+                        pcall(function()
+                            local parts = {}
+                            local dmg = stat.Damage
+                            if dmg and dmg ~= "" then
+                                parts[#parts+1] = tostring(dmg)
+                            end
+                            local dmgType = stat["Damage Type"]
+                            if dmgType and dmgType ~= "" then
+                                parts[#parts+1] = tostring(dmgType)
+                            end
+                            if #parts > 0 then
+                                item.DamageStr = table.concat(parts, " ")
+                            end
+                        end)
+                    end
+
+                    -- Armor class and armor type (Clothing/Light/Medium/Heavy)
+                    if item.Type == "Armor" then
+                        pcall(function()
+                            local ac = stat.ArmorClass
+                            if ac and tostring(ac) ~= "" and tostring(ac) ~= "0" then
+                                item.ArmorClass = tostring(ac)
+                            end
+                        end)
+                        pcall(function()
+                            local at = stat.ArmorType
+                            if at then item.ArmorType = tostring(at) end
+                        end)
+                    end
+
+                    -- Passives on equip (special effects)
+                    pcall(function()
+                        local passives = stat.PassivesOnEquip
+                        if passives and passives ~= "" then
+                            local descs = {}
+                            for passiveName in tostring(passives):gmatch("[^;]+") do
+                                passiveName = passiveName:match("^%s*(.-)%s*$")
+                                pcall(function()
+                                    local passiveStat = Ext.Stats.Get(passiveName)
+                                    if passiveStat then
+                                        local descHandle = nil
+                                        pcall(function() descHandle = passiveStat.Description end)
+                                        if descHandle and tostring(descHandle) ~= "" then
+                                            local translated = Ext.Loca.GetTranslatedString(tostring(descHandle))
+                                            if translated and translated ~= "" then
+                                                descs[#descs+1] = translated
+                                            end
+                                        end
+                                    end
+                                end)
+                            end
+                            if #descs > 0 then
+                                item.SpecialEffects = table.concat(descs, "\n")
+                            end
+                        end
+                    end)
+
+                    -- BoostsOnEquipMainHand confirmed in DIAG V3 but contains spell unlock strings,
+                    -- not human-readable text — skip for now
+
+                    -- Two-handed weapon detection via "Weapon Properties" table
+                    if item.Type == "Weapon" then
+                        pcall(function()
+                            local wpProps = stat["Weapon Properties"]
+                            if wpProps and type(wpProps) == "table" then
+                                for _, v in ipairs(wpProps) do
+                                    if tostring(v):lower():find("twohanded") then
+                                        item.TwoHanded = true
+                                        break
+                                    end
+                                end
+                            elseif wpProps then
+                                -- Fallback: if it's a string for some reason
+                                if tostring(wpProps):lower():find("twohanded") then
+                                    item.TwoHanded = true
+                                end
+                            end
+                        end)
+                    end
+                end
+            end
+        end)
+
+        return item
+    end)
+
+    if ok then
+        return itemData
+    else
+        return nil
+    end
+end
+
+--- Classify an item into a broad type category.
+function InventoryCollector._classifyItemType(itemEntity)
+    local function has(comp)
+        local ok, val = pcall(function() return itemEntity[comp] end)
+        return ok and val
+    end
+    if has("Weapon") then return "Weapon" end
+    if has("Armor") then return "Armor" end
+    if has("SpellBook") then return "Scroll" end
+    return "Misc"
+end
+
+--- Get display name of a character entity.
+function InventoryCollector._getCharacterName(charEntity)
+    local ok, name = pcall(function()
+        if charEntity.DisplayName and charEntity.DisplayName.Name then
+            local nameHandle = charEntity.DisplayName.Name.Handle
+            if nameHandle then
+                local handle = nameHandle.Handle or nameHandle
+                return Ext.Loca.GetTranslatedString(handle)
+            end
+        end
+        return nil
+    end)
+    return ok and name or nil
+end
+
+--- Send full inventory to a specific client.
+-- userId is a numeric peer ID; use BroadcastMessage instead since
+-- PostMessageToClient expects a character GUID.
+function InventoryCollector.SendToClient(userId)
+    local allItems = InventoryCollector.CollectAll()
+    local json = Ext.Json.Stringify(allItems)
+    -- BroadcastMessage works for single-player and avoids the GUID issue
+    Ext.ServerNet.BroadcastMessage("InvRework_FullInventory", json)
+end
+
+--- Send full inventory to all clients.
+function InventoryCollector.BroadcastToAll()
+    local allItems = InventoryCollector.CollectAll()
+    local json = Ext.Json.Stringify(allItems)
+    Ext.ServerNet.BroadcastMessage("InvRework_FullInventory", json)
+end
+
+-- Export
+Mods = Mods or {}
+Mods.InventoryExpanded = Mods.InventoryExpanded or {}
+Mods.InventoryExpanded.InventoryCollector = InventoryCollector
+
+return InventoryCollector

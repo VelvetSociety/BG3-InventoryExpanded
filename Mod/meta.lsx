@@ -1,0 +1,40 @@
+<?xml version='1.0' encoding='utf-8'?>
+<save>
+  <version major="4" minor="0" revision="9" build="331" />
+  <region id="Config">
+    <node id="root">
+      <children>
+        <node id="Dependencies">
+          <children>
+            <node id="ModuleShortDesc">
+              <attribute id="Folder" type="FixedString" value="BG3MCM" />
+              <attribute id="MD5" type="LSString" value="" />
+              <attribute id="Name" type="LSString" value="Mod Configuration Menu" />
+              <attribute id="UUID" type="FixedString" value="755a8a72-407f-4f0d-9a33-274ac0f0b53d" />
+              <attribute id="Version64" type="int64" value="36028797018963968" />
+            </node>
+          </children>
+        </node>
+        <node id="ModuleInfo">
+          <attribute id="Author" type="LSString" value="BlueVelvet" />
+          <attribute id="CharacterCreationLevelName" type="FixedString" value="" />
+          <attribute id="Description" type="LSString" value="Beta: shared inventory and armory panels for Baldur's Gate 3" />
+          <attribute id="Folder" type="LSString" value="InventoryExpanded" />
+          <attribute id="GMTemplate" type="FixedString" value="" />
+          <attribute id="LobbyLevelName" type="FixedString" value="" />
+          <attribute id="MD5" type="LSString" value="" />
+          <attribute id="MainMenuBackgroundVideo" type="FixedString" value="" />
+          <attribute id="MenuLevelName" type="FixedString" value="" />
+          <attribute id="Name" type="LSString" value="Inventory Expanded" />
+          <attribute id="NumPlayers" type="uint8" value="4" />
+          <attribute id="PhotoBooth" type="FixedString" value="" />
+          <attribute id="StartupLevelName" type="FixedString" value="" />
+          <attribute id="Tags" type="LSString" value="" />
+          <attribute id="Type" type="FixedString" value="Add-on" />
+          <attribute id="UUID" type="FixedString" value="68ac51da-c600-4de4-a795-417d371148bc" />
+          <attribute id="Version64" type="int64" value="36028799166447616" />
+        </node>
+      </children>
+    </node>
+  </region>
+</save>
